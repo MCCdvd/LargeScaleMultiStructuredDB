@@ -1,0 +1,139 @@
+================================================================================
+RIEPILOGO COMPLETO PIPELINE DATABASE (FE_DB -> BE_DB -> PF_DB -> ORDINI -> PDF)
+Progetto Java: Creazione_Database | Ambiente: Windows, JDK 27, IntelliJ IDEA, Maven
+================================================================================
+
+1. PANORAMICA DEL FLUSSO (ARCHITETTURA A STADI)
+--------------------------------------------------------------------------------
+La pipeline modella una linea produttiva a stadi successivi con tracciabilita
+end-to-end dei dati e dei lotti/pallet:
+
+  [FE_DB] (MongoDB)          -> Dati grezzi / semilavorati iniziali (cupper01_samples)
+     |
+     |  Ritardo: +30 minuti
+     |  Politica: FIFO (First-In, First-Out)
+     v
+  [BE_DB] (MongoDB)          -> Campioni spray e semilavorati WET_Cans (be_spray_samples)
+     |
+     |  Politica: FIFO rigoroso
+     |  Raggruppamento: gruppi da 968 cans per pallet
+     |  Tempo preparazione pallet: ~3 minuti per pallet
+     v
+  [PF_DB] (MongoDB)          -> Pallet prodotto finito (pallets)
+     |
+     |  Verifica manuale CQ (stato OK / KO + iniezione note, analisi, foto, docs)
+     |  Solo i pallet OK alimentano il conteggio/tracciatura degli ordini approvati
+     v
+  [Ordini] (SQL / MySQL)     -> Gestione ordini, pallet previsti vs OK, riferimenti cert.
+     |
+     v
+  [cert_ordine.pdf]          -> Certificato di qualita e tracciabilita per ordine
+
+
+2. DETTAGLIO DATABASE E VINCOLI OPERATIVI
+--------------------------------------------------------------------------------
+
+A) FE_DB (MongoDB)
+- Collection principale: cupper01_samples (verificati 480 documenti).
+- Ruolo: acquisizione/campionamento iniziale di linea (es. misure semilavorati
+  come Top_Wall_Wet_Can_1..9).
+
+B) BE_DB (MongoDB)
+- Collection principale: be_spray_samples (verificati 810 documenti).
+- Vincolo temporale: ritardo di +30 minuti rispetto a FE_DB
+  (es. primo record FE a 2026-11-22T17:14:00Z -> primo record BE a 2026-11-22T17:44:00Z).
+- Vincolo di ordinamento: FIFO (i primi dati entrati/prodotti sono i primi elaborati).
+- Struttura tipica di un documento in be_spray_samples:
+  * line: es. "BE_Line01"
+  * minuteIndex: indice progressivo del minuto (es. 0, 1, 2, ...)
+  * timestamp: istante del campione BE (ISO-8601 UTC)
+  * beDelayMinutes: 30
+  * orderPolicy: "FIFO"
+  * semifinishedType: "WET_Cans"
+  * sprayThikDistrSpecMgSm: { min: 3, max: 4, center: 3.5 }
+  * canSprayMeansMgSm: medie per Can_Spray_1 .. Can_Spray_5
+  * WET_Cans: oggetto con Can_Spray_1 .. Can_Spray_5, ciascuno con:
+      - wetCan (es. "Wet_Can_01")
+      - sourceField (es. "Top_Wall_Wet_Can_1")
+      - thicknessMm
+      - feTimestamp
+      - beTimestamp
+  * Spray_thik_distr: valori numerici per Can_Spray_1 .. Can_Spray_5 (in mg/sm).
+- Soglie di controllo qualita' spray (esempio/riferimento):
+  * Fascia specifica nominale: [3.0, 4.0] mg/sm (centro 3.5 mg/sm).
+  * Semi-ampiezza di riferimento: 0.50 mg/sm rispetto al centro 3.5.
+
+C) PF_DB (MongoDB)
+- Collection principale: pallets.
+- Vincolo di ordinamento: FIFO rigoroso da BE_DB (ordinamento per timestamp e
+  minuteIndex crescenti): i primi dati in BE_DB sono i primi in PF_DB.
+- Vincolo di dimensione pallet: blocchi fino a 968 cans per pallet (l'ultimo
+  pallet puo' avere meno di 968 cans se il resto della divisione per 968 non e' zero).
+- Numerazione progressiva: palletProgressivo = 1, 2, 3, ...
+- Tempo di preparazione: circa 3 minuti per pallet (usato per calcolare il
+  timestamp di preparazione del singolo pallet).
+- Formato obbligatorio della chiave pallet:
+    numeroOrdine:palletNProgressivo:timestampPreparazione:stato
+  Esempio:
+    ORD-2026-001:1:2026-11-22T17:47:00Z:PENDING
+    (dopo verifica CQ: ORD-2026-001:1:2026-11-22T18:10:00Z:OK oppure ...:KO)
+- Stato del pallet: OK oppure KO (in fase iniziale di sola preparazione DB puo'
+  partire come PENDING in attesa della verifica dell'addetto al Controllo Qualita').
+- Iniezione manuale CQ su PF_DB: l'addetto CQ puo' aggiungere manualmente note/
+  commenti, esiti di analisi precedenti, selezioni manuali e riferimenti/percorsi
+  a foto o altri documenti tecnici.
+
+D) Ordini (Database SQL - MySQL)
+- Database: Ordini (connessione JDBC su localhost:3306).
+- Tabella principale ordini:
+  * numero_ordine (PK, es. VARCHAR(64))
+  * descrizione (VARCHAR(255))
+  * quantita (INT - quantita' totale prevista / unita' ordine)
+  * pallet_previsti (INT - es. ceil(quantita / 968))
+  * pallet_prodotti_ok (INT - quanti pallet sono realmente prodotti e con stato OK)
+  * data_inserimento_ordine (DATETIME)
+  * data_chiusura_ordine (DATETIME NULL)
+  * stato (VARCHAR(32))
+  * riferimento_certificato (VARCHAR(255) NULL)
+- Tabella di tracciatura pallet associata (es. pallet_ordine / pallet_ok_tracciatura):
+  * collega numero_ordine, pallet_progressivo, chiave_pallet (UNIQUE), cans_count,
+    timestamp_preparazione / data_verifica_cq, stato e note/operatore CQ.
+- Vincolo fondamentale: quando un pallet riceve stato OK, viene salvato/conteggiato
+  nel database Ordini tra i pallet prodotti con esito OK.
+
+E) cert_ordine.pdf (Certificato Qualita e Tracciabilita)
+- Generato per ciascun ordine come cert_ordine.pdf.
+- Contiene:
+  * numero d'ordine, pallet previsti vs pallet realmente prodotti con stato OK;
+  * estremi del certificato qualitativo emesso dal CQ;
+  * chi ha deliberato i pallet (operatore/responsabile CQ) e data/ora;
+  * commenti del CQ, analisi precedenti, selezioni manuali ed eventuali foto o
+    altri documenti (inclusi riferimenti e/o immagini incorporate nel PDF).
+
+
+3. NOTE PRATICHE E TRUCCHI PER APPRENDERE E RICORDARE FACILMENTE I DATI
+--------------------------------------------------------------------------------
+1) Regola d'oro dei 3 numeri chiave:
+   - "+30 min"  = ritardo da FE_DB a BE_DB.
+   - "968 cans" = capienza massima di un pallet in PF_DB.
+   - "+3 min"   = tempo indicativo di preparazione di un pallet per il timestamp.
+
+2) Come leggere la chiave del pallet in un colpo d'occhio:
+   [numeroOrdine] : [palletNProgressivo] : [timestampVerifica/Preparazione] : [OK/KO/PENDING]
+   Divisa dai due punti (:): 4 pezzi in ordine fisso -> Ordine, Numero progressivo,
+   Data/Ora, Stato.
+
+3) Differenza tra i due database NoSQL e quello SQL:
+   - MongoDB (FE_DB, BE_DB, PF_DB): documenti flessibili e gerarchici, ottimi per
+     storicizzare misure per canale (Can_Spray_1..5), semilavorati (WET_Cans),
+     liste di cans dentro il pallet e allegati/note CQ.
+   - SQL (Ordini): tabelle strutturate e relazioni (chiave primaria/esterna),
+     ideali per contare con precisione pallet previsti vs pallet OK per ordine
+     e collegare il riferimento a cert_ordine.pdf.
+
+4) Checklist rapida per verificare lo stato del sistema:
+   - In mongosh: non mettere il punto e virgola dopo "show dbs"; per script
+     lunghi usare un file .js con "mongosh ... --file script.js" o load("...").
+   - In Java / IntelliJ: se compare "No suitable driver found for jdbc:mysql://...",
+     controllare che mysql-connector-j (es. 9.7.0 o 8.1.0 in .m2) sia nel
+     pom.xml e nel classpath della Run Configuration / modulo.
